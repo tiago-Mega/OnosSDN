@@ -70,7 +70,7 @@ echo ""
 
 # Step 2: Build the application
 echo "Step 2: Building ONOS application..."
-cd /workspaces/OnosSDNstudent
+cd /workspaces/OnosSDN
 
 if mvn -q clean package -DskipTests; then
     print_success "Application built successfully"

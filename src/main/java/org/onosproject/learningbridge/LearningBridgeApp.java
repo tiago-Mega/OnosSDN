@@ -177,8 +177,7 @@ public class LearningBridgeApp {
             DeviceId deviceId = pkt.receivedFrom().deviceId();
             PortNumber inPort = pkt.receivedFrom().port();
 
-            log.debug("Packet received: {} -> {} on device {} port {}", 
-                      srcMac, dstMac, deviceId, inPort);
+            log.debug("Packet received: {} -> {} on device {} port {}", srcMac, dstMac, deviceId, inPort);
 
             // TODO: TASK 6 - Implement MAC Address Learning
             // HINT: Update macTables with srcMac -> inPort mapping for this deviceId
