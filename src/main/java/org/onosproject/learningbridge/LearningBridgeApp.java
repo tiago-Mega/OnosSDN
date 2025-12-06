@@ -140,7 +140,7 @@ public class LearningBridgeApp {
         TrafficSelector.Builder selector = DefaultTrafficSelector.builder();
         packetService.requestPackets(selector.build(), PacketPriority.REACTIVE, appId);
 
-        log.info("Learning Bridge Application Started (Student Version - Hub Mode)");
+        log.info("Learning Bridge Application Started (Author - Tiago Mega)");
     }
 
     @Deactivate
@@ -194,10 +194,11 @@ public class LearningBridgeApp {
             // HINT: If limit reached, block packet with context.block()
             if (!dstMac.isBroadcast() && !dstMac.isMulticast()) {
                 if (!isConnectionAllowed(srcMac, dstMac)) {
-                    log.warn("Connection limit reached for {}. Blocking packet to {}", srcMac, dstMac);
                     context.block();  // Drop the packet
                     return;           // Don't process further
                 }
+            } else {
+                log.debug("Skipping connection limit for broadcast/multicast: {} -> {}", srcMac, dstMac);
             }
 
             // TODO: TASK 8 - Handle TCP Packets (ADVANCED)
@@ -224,8 +225,7 @@ public class LearningBridgeApp {
                 flood(context);
             }
 
-            // Just flood (HUB behavior)
-            // flood(context);
+            // Just flood (HUB behavior) -> flood(context);
         }
 
         /**
@@ -292,6 +292,7 @@ public class LearningBridgeApp {
                 log.error("Failed to install flow rule", e);
             }
 
+            // Update activeDestinations for connection limiting
             activeDestinations.putIfAbsent(srcMac, ConcurrentHashMap.newKeySet());
             activeDestinations.get(srcMac).add(dstMac);
 
@@ -314,7 +315,7 @@ public class LearningBridgeApp {
             TCP tcpPacket = (TCP) ipv4Packet.getPayload();
             int srcPort = tcpPacket.getSourcePort();
             int dstPort = tcpPacket.getDestinationPort();
-
+            
             int flags = tcpPacket.getFlags(); 
             boolean isSyn = (flags & 0x02) != 0;
 
@@ -325,21 +326,19 @@ public class LearningBridgeApp {
                 // Store in tcpConnections if new
                 if(!tcpConnections.containsKey(connKey)) {
                     long startTimeMillis = System.currentTimeMillis();
-                    tcpConnections.putIfAbsent(connKey, 
-                        new TcpConnectionInfo(deviceId, srcMac, dstMac, startTimeMillis)
-                    );
-
+                    tcpConnections.putIfAbsent(connKey, new TcpConnectionInfo(deviceId, srcMac, dstMac, startTimeMillis));
                     log.info("Tracking new TCP connection: {}:{} -> {}:{}", srcIp, srcPort, dstIp, dstPort);
                 }
             }
         }
 
-        // Helper method for connection limiting
+        // TODO: Helper method for connection limiting
         private boolean isConnectionAllowed(MacAddress srcMac, MacAddress dstMac) {
             Set<MacAddress> destinations = activeDestinations.get(srcMac);
     
+            // No existing connections from srcMac
             if (destinations == null) {
-                return true; // No existing connections from this source
+                return true; 
             }
             
             // Already talking to this destination - allow (existing connection)
@@ -398,16 +397,16 @@ public class LearningBridgeApp {
             
             // Check if any other flows exist between them
             if (!hasActiveFlowsBetween(srcMac, dstMac)) {
-                // If not, remove from activeDestinations
-                Set<MacAddress> destinations = activeDestinations.get(srcMac);
-                if (destinations != null) {
-                    destinations.remove(dstMac);
-                    log.info("Removed active destination {} for source {}", dstMac, srcMac);
-                
-                    // Clean up if no more destinations
-                    if (destinations.isEmpty()) {
-                        activeDestinations.remove(srcMac);
+                // Check if any active TCP connections exist between them
+                if (!hasActiveConnectionsTo(srcMac, dstMac)) {  
+                    // Remove from activeDestinations
+                    Set<MacAddress> destinations = activeDestinations.get(srcMac);
+                    if (destinations != null) {
+                        destinations.remove(dstMac);
+                        log.info("Removed active destination {} for source {}", dstMac, srcMac);
                     }
+                } else {
+                    log.debug("TCP connections still active between {} and {}, keeping destination", srcMac, dstMac);
                 }
             }
         }
@@ -462,12 +461,21 @@ public class LearningBridgeApp {
             IPCriterion dstIpCriterion = (IPCriterion) selector.getCriterion(Criterion.Type.IPV4_DST);
 
             // Ensure all criteria are present
-            if (srcEthCriterion == null || dstEthCriterion == null ||
-                srcIpCriterion == null || dstIpCriterion == null) {
-                return; // Incomplete TCP flow criteria
+            if (srcEthCriterion == null || dstEthCriterion == null || srcIpCriterion == null || dstIpCriterion == null) {
+                return; 
             }
 
+            // Get statistics from FlowEntry (bytes(), packets())
+            if (flowRule instanceof FlowEntry) {
+                FlowEntry flowEntry = (FlowEntry) flowRule;
+                bytes = flowEntry.bytes();
+                packets = flowEntry.packets();
+                log.info("Got stats from FlowEntry: {} bytes, {} packets", bytes, packets);
+            } else {
+                log.warn("FlowRule is not FlowEntry, cannot get stats");
+            }
 
+            // Create ConnectionKey
             ConnectionKey logKey = new ConnectionKey(
                 srcEthCriterion.mac(),
                 dstEthCriterion.mac(),
@@ -477,29 +485,14 @@ public class LearningBridgeApp {
                 dstTcpCriterion.tcpPort().toInt()
             );  
             
-            // Get statistics from FlowEntry (bytes(), packets())
+            // Remove from tcpConnections and set end time
             TcpConnectionInfo info = tcpConnections.remove(logKey);
             if (info != null) {
                 info.setEndTime();
-                
-                // Try to get stats from FlowEntry if available
-                for (Device device : deviceService.getAvailableDevices()) {
-                    if (device.type() != Device.Type.SWITCH) {
-                        continue;
-                    }
-                    for (FlowEntry entry : flowRuleService.getFlowEntries(device.id())) {
-                        if (entry.id().equals(flowRule.id())) {
-                            bytes = entry.bytes();
-                            packets = entry.packets();
-                            
-                            break; // Found matching flow entry
-                        }
-                    }
-                }
             }
 
             // Log connection statistics
-            logTcpConnectionStats(logKey, info, bytes, packets); // Replace 0s with actual stats if available
+            logTcpConnectionStats(logKey, info, bytes, packets); 
         }
 
         // TODO: TASK 17 - Implement hasActiveConnectionsTo method (ADVANCED)
@@ -525,8 +518,9 @@ public class LearningBridgeApp {
         // Format: timestamp | SrcMAC | DstMAC | srcIP:srcPort -> dstIP:dstPort | Duration(ms) | Bytes | Packets
         String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
 
-        String logEntry = String.format("%s | %s | %s | %s | %d | %d | %d",
+        String logEntry = String.format("%s | %s | %s | %s | %s | %d | %d | %d",
                 timestamp,
+                info.deviceId,
                 info.srcMac,
                 info.dstMac,
                 connKey.toString(),  // "srcIP:srcPort -> dstIP:dstPort"
@@ -554,7 +548,7 @@ public class LearningBridgeApp {
             ConnectionKey connKey = entry.getKey();
             TcpConnectionInfo info = entry.getValue();
 
-            // For simplicity, log with zero bytes/packets (real implementation would track these)
+            // For simplicity, log with zero bytes/packets (on shutdown)
             logTcpConnectionStats(connKey, info, 0, 0);
         }
     }
@@ -565,6 +559,7 @@ public class LearningBridgeApp {
 
     // TODO: TASK 20 - Implement ConnectionKey class
     // See IMPLEMENTATION_GUIDE.md for structure and purpose
+    //
     private static class ConnectionKey {
         
         // Fields to uniquely identify TCP connection
@@ -614,6 +609,7 @@ public class LearningBridgeApp {
 
     // TODO: TASK 21 - Implement TcpConnectionInfo class
     // See IMPLEMENTATION_GUIDE.md for structure and purpose
+    //
     private static class TcpConnectionInfo {
 
         // Fields to store connection metadata
