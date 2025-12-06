@@ -27,7 +27,7 @@
 ### Step 2: Build the Application
 
 ```bash
-cd /workspaces/OnosSDNstudent
+cd /workspaces/OnosSDN
 ./build.sh
 ```
 
@@ -67,14 +67,14 @@ onos-cli
 In the ONOS CLI:
 
 ```text
-onos> bundle:install -s file:/workspaces/OnosSDNstudent/target/learning-bridge-1.0-SNAPSHOT.jar
+onos> bundle:install -s file:/workspaces/OnosSDN/target/learning-bridge-1.0-SNAPSHOT.jar
 onos> bundle:list | grep learning
 ```
 
 **After code changes**, update instead of reinstalling:
 ```text
 onos> bundle:list | grep learning       # note the ID (e.g., 200)
-onos> bundle:update 200 file:/workspaces/OnosSDNstudent/target/learning-bridge-1.0-SNAPSHOT.jar
+onos> bundle:update 200 file:/workspaces/OnosSDN/target/learning-bridge-1.0-SNAPSHOT.jar
 ```
 
 ---

@@ -110,20 +110,22 @@ public class LearningBridgeApp {
     // TODO: TASK 1 - Declare MAC Learning Table
     // HINT: Map<DeviceId, Map<MacAddress, PortNumber>> to store MAC->Port mappings per device
     // HINT: Use ConcurrentHashMap for thread-safety
-    // private Map<DeviceId, Map<MacAddress, PortNumber>> macTables = new ConcurrentHashMap<>();
+    private Map<DeviceId, Map<MacAddress, PortNumber>> macTables = new ConcurrentHashMap<>();
 
     // TODO: TASK 2 - Declare Connection Tracking (for connection limiting)
     // HINT: Map<MacAddress, Set<MacAddress>> to track active destinations per source
-    // private Map<MacAddress, Set<MacAddress>> activeDestinations = new ConcurrentHashMap<>();
+    private Map<MacAddress, Set<MacAddress>> activeDestinations = new ConcurrentHashMap<>();
 
     // TODO: TASK 3 - Declare TCP Connection Tracking (for statistics)
     // HINT: Map<ConnectionKey, TcpConnectionInfo> to track TCP connections
-    // private Map<ConnectionKey, TcpConnectionInfo> tcpConnections = new ConcurrentHashMap<>();
+    private Map<ConnectionKey, TcpConnectionInfo> tcpConnections = new ConcurrentHashMap<>();
 
     // TODO: TASK 4 - Define Configuration Constants
-    // private static final int MAX_CONNECTIONS_PER_HOST = 2;
-    // private static final int FLOW_TIMEOUT = 5;  // seconds
-    // private static final String LOG_FILE_PATH = "/tmp/tcp_connections.log";
+    private static final int MAX_CONNECTIONS_PER_HOST = 2;
+    private static final int FLOW_TIMEOUT = 5;  // seconds
+    private static final String LOG_FILE_PATH = "/tmp/tcp_connections.log";
+    private static final int FLOW_PRIORITY = 100;
+    private static final int TCP_FLOW_PRIORITY = 200;
 
     // ============================================================================
     // APPLICATION LIFECYCLE (ALREADY IMPLEMENTED)
@@ -148,6 +150,7 @@ public class LearningBridgeApp {
         flowRuleService.removeFlowRulesById(appId);
 
         // TODO: TASK 5 - Call logAllConnectionStats() if implementing TCP tracking
+        logAllConnectionStats();
 
         log.info("Learning Bridge Application Stopped");
     }
@@ -181,37 +184,48 @@ public class LearningBridgeApp {
 
             // TODO: TASK 6 - Implement MAC Address Learning
             // HINT: Update macTables with srcMac -> inPort mapping for this deviceId
-            // macTables.putIfAbsent(deviceId, new ConcurrentHashMap<>());
-            // macTables.get(deviceId).put(srcMac, inPort);
-            // log.info("Learned: {} -> port {} on device {}", srcMac, inPort, deviceId);
+            macTables.putIfAbsent(deviceId, new ConcurrentHashMap<>());
+            macTables.get(deviceId).put(srcMac, inPort);
+            log.info("Learned: {} -> port {} on device {}", srcMac, inPort, deviceId);
 
             // TODO: TASK 7 - Implement Connection Limiting (ADVANCED)
             // HINT: Only for unicast (not broadcast/multicast)
             // HINT: Check if destination count exceeds MAX_CONNECTIONS_PER_HOST
             // HINT: If limit reached, block packet with context.block()
-            // if (!dstMac.isBroadcast() && !dstMac.isMulticast()) {
-            //     // Track and enforce connection limit  
-            // }
+            if (!dstMac.isBroadcast() && !dstMac.isMulticast()) {
+                if (!isConnectionAllowed(srcMac, dstMac)) {
+                    log.warn("Connection limit reached for {}. Blocking packet to {}", srcMac, dstMac);
+                    context.block();  // Drop the packet
+                    return;           // Don't process further
+                }
+            }
 
             // TODO: TASK 8 - Handle TCP Packets (ADVANCED)
             // HINT: Check if packet is IPv4 and TCP protocol
             // HINT: Call handleTcpTracking() to track SYN packets
-            // boolean isTcp = false;
-            // if (ethPkt.getEtherType() == Ethernet.TYPE_IPV4) {
-            //     IPv4 ipv4Packet = (IPv4) ethPkt.getPayload();
-            //     if (ipv4Packet.getProtocol() == IPv4.PROTOCOL_TCP) {
-            //         isTcp = true;
-            //         handleTcpTracking(context, ethPkt, ipv4Packet);
-            //     }
-            // }
+            boolean isTcp = false;
+            if (ethPkt.getEtherType() == Ethernet.TYPE_IPV4) {
+                IPv4 ipv4Packet = (IPv4) ethPkt.getPayload();
+                if (ipv4Packet.getProtocol() == IPv4.PROTOCOL_TCP) {
+                    isTcp = true;
+                    handleTcpTracking(context, ethPkt, ipv4Packet);
+                }
+            }
 
             // TODO: TASK 9 - Implement Forwarding Decision
             // HINT: Look up dstMac in macTables.get(deviceId)
             // HINT: If found, call installRule(context, outPort, isTcp)
             // HINT: If not found, call flood(context)
-            
-            // CURRENT IMPLEMENTATION: Just flood (HUB behavior)
-            flood(context);
+            Map<MacAddress, PortNumber> deviceMacTable = macTables.get(deviceId);
+            if (deviceMacTable != null && deviceMacTable.containsKey(dstMac)) {
+                PortNumber outPort = deviceMacTable.get(dstMac);
+                installRule(context, outPort, isTcp);
+            } else {
+                flood(context);
+            }
+
+            // Just flood (HUB behavior)
+            // flood(context);
         }
 
         /**
@@ -224,21 +238,122 @@ public class LearningBridgeApp {
         }
 
         // TODO: TASK 10 - Implement installRule method
-        // private void installRule(PacketContext context, PortNumber portNumber, boolean isTcp) {
-        //     // Build TrafficSelector with MAC addresses, input port
-        //     // For TCP: add IP addresses and ports
-        //     // Build TrafficTreatment with output port
-        //     // Create ForwardingObjective with priority and timeout
-        //     // Install with flowObjectiveService.forward()
-        //     // Forward current packet
-        // }
+        private void installRule(PacketContext context, PortNumber portNumber, boolean isTcp) {
+            Ethernet ethPkt = context.inPacket().parsed();
+            MacAddress srcMac = ethPkt.getSourceMAC();
+            MacAddress dstMac = ethPkt.getDestinationMAC();
+            DeviceId deviceId = context.inPacket().receivedFrom().deviceId();
+            PortNumber inPort = context.inPacket().receivedFrom().port();
+
+            // Build TrafficSelector with MAC addresses, input port
+            TrafficSelector.Builder selectorBuilder = DefaultTrafficSelector.builder()
+                .matchInPort(inPort)
+                .matchEthSrc(srcMac)
+                .matchEthDst(dstMac)
+            ;
+
+            // For TCP: add IP addresses and ports
+            if (isTcp && ethPkt.getEtherType() == Ethernet.TYPE_IPV4) {
+                IPv4 ipv4Packet = (IPv4) ethPkt.getPayload();
+                selectorBuilder.matchEthType(Ethernet.TYPE_IPV4)
+                               .matchIPSrc(Ip4Prefix.valueOf(Ip4Address.valueOf(ipv4Packet.getSourceAddress()), 32))
+                               .matchIPDst(Ip4Prefix.valueOf(Ip4Address.valueOf(ipv4Packet.getDestinationAddress()), 32));  
+                
+                if (ipv4Packet.getPayload() instanceof TCP) {
+                    TCP tcpPacket = (TCP) ipv4Packet.getPayload();
+                    selectorBuilder.matchIPProtocol(IPv4.PROTOCOL_TCP)
+                                   .matchTcpSrc(TpPort.tpPort(tcpPacket.getSourcePort()))
+                                   .matchTcpDst(TpPort.tpPort(tcpPacket.getDestinationPort()));
+                }
+            }
+
+            // Build TrafficTreatment with output port
+            TrafficTreatment treatment = DefaultTrafficTreatment.builder()
+                .setOutput(portNumber)
+                .build()
+            ;
+            
+            // Create ForwardingObjective with priority and timeout
+            int priority = isTcp ? TCP_FLOW_PRIORITY : FLOW_PRIORITY;
+            ForwardingObjective forwardingObjective = DefaultForwardingObjective.builder()
+                .withSelector(selectorBuilder.build())
+                .withTreatment(treatment)
+                .withPriority(priority)
+                .withFlag(ForwardingObjective.Flag.VERSATILE)
+                .makeTemporary(FLOW_TIMEOUT)
+                .fromApp(appId)
+                .add()
+            ;
+
+            // Install with flowObjectiveService.forward()
+            try {
+                flowObjectiveService.forward(deviceId, forwardingObjective);
+            } catch (Exception e) {
+                log.error("Failed to install flow rule", e);
+            }
+
+            activeDestinations.putIfAbsent(srcMac, ConcurrentHashMap.newKeySet());
+            activeDestinations.get(srcMac).add(dstMac);
+
+            // Forward current packet
+            context.treatmentBuilder().setOutput(portNumber);
+            context.send();
+
+            log.info("Installed flow rule on device {}: {} -> {} out port {} (TCP: {})", deviceId, srcMac, dstMac, portNumber, isTcp);
+        }
 
         // TODO: TASK 11 - Implement handleTcpTracking method (ADVANCED)
-        // private void handleTcpTracking(PacketContext context, Ethernet ethPkt, IPv4 ipv4Packet) {
-        //     // Extract TCP packet, check for SYN flag
-        //     // Create ConnectionKey
-        //     // Store in tcpConnections if new
-        // }
+        private void handleTcpTracking(PacketContext context, Ethernet ethPkt, IPv4 ipv4Packet) {
+            MacAddress srcMac = ethPkt.getSourceMAC();
+            MacAddress dstMac = ethPkt.getDestinationMAC();
+            DeviceId deviceId = context.inPacket().receivedFrom().deviceId();
+            Ip4Address srcIp = Ip4Address.valueOf(ipv4Packet.getSourceAddress());
+            Ip4Address dstIp = Ip4Address.valueOf(ipv4Packet.getDestinationAddress());
+            
+            // Extract TCP packet, check for SYN flag
+            TCP tcpPacket = (TCP) ipv4Packet.getPayload();
+            int srcPort = tcpPacket.getSourcePort();
+            int dstPort = tcpPacket.getDestinationPort();
+
+            int flags = tcpPacket.getFlags(); 
+            boolean isSyn = (flags & 0x02) != 0;
+
+            if (isSyn) {                
+                // Create ConnectionKey
+                ConnectionKey connKey = new ConnectionKey(srcMac, dstMac, srcIp, dstIp, srcPort, dstPort);
+                
+                // Store in tcpConnections if new
+                if(!tcpConnections.containsKey(connKey)) {
+                    long startTimeMillis = System.currentTimeMillis();
+                    tcpConnections.putIfAbsent(connKey, 
+                        new TcpConnectionInfo(deviceId, srcMac, dstMac, startTimeMillis)
+                    );
+
+                    log.info("Tracking new TCP connection: {}:{} -> {}:{}", srcIp, srcPort, dstIp, dstPort);
+                }
+            }
+        }
+
+        // Helper method for connection limiting
+        private boolean isConnectionAllowed(MacAddress srcMac, MacAddress dstMac) {
+            Set<MacAddress> destinations = activeDestinations.get(srcMac);
+    
+            if (destinations == null) {
+                return true; // No existing connections from this source
+            }
+            
+            // Already talking to this destination - allow (existing connection)
+            if (destinations.contains(dstMac)) {
+                return true;
+            }
+            
+            // Check if at limit
+            if (destinations.size() >= MAX_CONNECTIONS_PER_HOST) {
+                return false;  // Reject: at capacity for new destination
+            }
+            
+            return true;  // Allow: have capacity for new destination
+        }
     }
 
     // ============================================================================
@@ -259,35 +374,145 @@ public class LearningBridgeApp {
                 log.debug("Flow rule removed: {}", flowRule.id());
                 
                 // TODO: TASK 12 - Call handleFlowRemoval(flowRule)
+                handleFlowRemoval(flowRule);
+
                 // TODO: TASK 13 - Call handleTcpFlowRemoval(flowRule) for TCP flows
+                handleTcpFlowRemoval(flowRule);
             }
         }
 
         // TODO: TASK 14 - Implement handleFlowRemoval method
-        // private void handleFlowRemoval(FlowRule flowRule) {
-        //     // Extract src and dst MAC from flow rule
-        //     // Check if any other flows exist between them
-        //     // If not, remove from activeDestinations
-        // }
+        private void handleFlowRemoval(FlowRule flowRule) {
+            TrafficSelector selector = flowRule.selector();
+
+            // Extract src and dst MAC from flow rule
+            EthCriterion srcEthCriterion = (EthCriterion) selector.getCriterion(Criterion.Type.ETH_SRC);
+            EthCriterion dstEthCriterion = (EthCriterion) selector.getCriterion(Criterion.Type.ETH_DST);
+
+            if (srcEthCriterion == null || dstEthCriterion == null) {
+                return; // Not a MAC-based flow
+            }
+
+            MacAddress srcMac = srcEthCriterion.mac();
+            MacAddress dstMac = dstEthCriterion.mac();
+            
+            // Check if any other flows exist between them
+            if (!hasActiveFlowsBetween(srcMac, dstMac)) {
+                // If not, remove from activeDestinations
+                Set<MacAddress> destinations = activeDestinations.get(srcMac);
+                if (destinations != null) {
+                    destinations.remove(dstMac);
+                    log.info("Removed active destination {} for source {}", dstMac, srcMac);
+                
+                    // Clean up if no more destinations
+                    if (destinations.isEmpty()) {
+                        activeDestinations.remove(srcMac);
+                    }
+                }
+            }
+        }
 
         // TODO: TASK 15 - Implement hasActiveFlowsBetween method
-        // private boolean hasActiveFlowsBetween(MacAddress srcMac, MacAddress dstMac) {
-        //     // Query all devices and their flow entries
-        //     // Return true if any flow matches srcMac -> dstMac
-        // }
+        private boolean hasActiveFlowsBetween(MacAddress srcMac, MacAddress dstMac) {
+            // Query all devices and their flow entries
+            for (Device device : deviceService.getAvailableDevices()) {
+                if (device.type() == Device.Type.SWITCH) {
+                    Iterable<FlowEntry> flowsEntry = flowRuleService.getFlowEntries(device.id());
+                    for (FlowEntry flowEntry : flowsEntry) {
+                        if (flowEntry.appId() == appId.id()) {
+                            TrafficSelector selector = flowEntry.selector();
+                            EthCriterion srcEthCriterion = (EthCriterion) selector.getCriterion(Criterion.Type.ETH_SRC);
+                            EthCriterion dstEthCriterion = (EthCriterion) selector.getCriterion(Criterion.Type.ETH_DST);
+
+                            if (srcEthCriterion != null && dstEthCriterion != null) {
+                                MacAddress flowSrcMac = srcEthCriterion.mac();
+                                MacAddress flowDstMac = dstEthCriterion.mac();
+
+                                if (flowSrcMac.equals(srcMac) && flowDstMac.equals(dstMac)) {
+                                    // Return true if any flow matches srcMac -> dstMac            
+                                    return true; 
+                                }
+                            }
+                        }
+                    }            
+                }
+            }
+
+            return false; // No active flows found between srcMac -> dstMac
+        }
 
         // TODO: TASK 16 - Implement handleTcpFlowRemoval method (ADVANCED)
-        // private void handleTcpFlowRemoval(FlowRule flowRule) {
-        //     // Check if TCP flow
-        //     // Extract connection details
-        //     // Get statistics from FlowEntry (bytes(), packets())
-        //     // Log to file with duration, bytes, packets
-        // }
+        private void handleTcpFlowRemoval(FlowRule flowRule) {
+            TrafficSelector selector = flowRule.selector();
+            long bytes = 0;
+            long packets = 0;
+
+            // Check if TCP flow
+            TcpPortCriterion srcTcpCriterion = (TcpPortCriterion) selector.getCriterion(Criterion.Type.TCP_SRC);
+            TcpPortCriterion dstTcpCriterion = (TcpPortCriterion) selector.getCriterion(Criterion.Type.TCP_DST);
+
+            if (srcTcpCriterion == null || dstTcpCriterion == null) {
+                return; // Not a TCP flow
+            }
+
+            // Extract connection details
+            EthCriterion srcEthCriterion = (EthCriterion) selector.getCriterion(Criterion.Type.ETH_SRC);
+            EthCriterion dstEthCriterion = (EthCriterion) selector.getCriterion(Criterion.Type.ETH_DST);
+            IPCriterion srcIpCriterion = (IPCriterion) selector.getCriterion(Criterion.Type.IPV4_SRC);
+            IPCriterion dstIpCriterion = (IPCriterion) selector.getCriterion(Criterion.Type.IPV4_DST);
+
+            // Ensure all criteria are present
+            if (srcEthCriterion == null || dstEthCriterion == null ||
+                srcIpCriterion == null || dstIpCriterion == null) {
+                return; // Incomplete TCP flow criteria
+            }
+
+
+            ConnectionKey logKey = new ConnectionKey(
+                srcEthCriterion.mac(),
+                dstEthCriterion.mac(),
+                srcIpCriterion.ip().getIp4Prefix().address(),
+                dstIpCriterion.ip().getIp4Prefix().address(),
+                srcTcpCriterion.tcpPort().toInt(),
+                dstTcpCriterion.tcpPort().toInt()
+            );  
+            
+            // Get statistics from FlowEntry (bytes(), packets())
+            TcpConnectionInfo info = tcpConnections.remove(logKey);
+            if (info != null) {
+                info.setEndTime();
+                
+                // Try to get stats from FlowEntry if available
+                for (Device device : deviceService.getAvailableDevices()) {
+                    if (device.type() != Device.Type.SWITCH) {
+                        continue;
+                    }
+                    for (FlowEntry entry : flowRuleService.getFlowEntries(device.id())) {
+                        if (entry.id().equals(flowRule.id())) {
+                            bytes = entry.bytes();
+                            packets = entry.packets();
+                            
+                            break; // Found matching flow entry
+                        }
+                    }
+                }
+            }
+
+            // Log connection statistics
+            logTcpConnectionStats(logKey, info, bytes, packets); // Replace 0s with actual stats if available
+        }
 
         // TODO: TASK 17 - Implement hasActiveConnectionsTo method (ADVANCED)
-        // private boolean hasActiveConnectionsTo(MacAddress srcMac, MacAddress dstMac) {
-        //     // Check tcpConnections map for matching entries
-        // }
+        private boolean hasActiveConnectionsTo(MacAddress srcMac, MacAddress dstMac) {
+            // Check tcpConnections map for matching entries
+            for (Map.Entry<ConnectionKey, TcpConnectionInfo> entry : tcpConnections.entrySet()) {
+                ConnectionKey key = entry.getKey();
+                if (key.srcMac.equals(srcMac) && key.dstMac.equals(dstMac)) {
+                    return true; // Active TCP connection exists
+                }
+            }
+            return false;
+        }
     }
 
     // ============================================================================
@@ -295,16 +520,44 @@ public class LearningBridgeApp {
     // ============================================================================
 
     // TODO: TASK 18 - Implement logTcpConnectionStats method
-    // private void logTcpConnectionStats(ConnectionKey connKey, TcpConnectionInfo info, 
-    //                                    long bytes, long packets) {
-    //     // Format: timestamp | SrcMAC | DstMAC | srcIP:srcPort -> dstIP:dstPort | Duration(ms) | Bytes | Packets
-    //     // Write to LOG_FILE_PATH
-    // }
+    private void logTcpConnectionStats(ConnectionKey connKey, TcpConnectionInfo info, long bytes, long packets) {
+
+        // Format: timestamp | SrcMAC | DstMAC | srcIP:srcPort -> dstIP:dstPort | Duration(ms) | Bytes | Packets
+        String timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+
+        String logEntry = String.format("%s | %s | %s | %s | %d | %d | %d",
+                timestamp,
+                info.srcMac,
+                info.dstMac,
+                connKey.toString(),  // "srcIP:srcPort -> dstIP:dstPort"
+                info.getDurationMillis(),
+                bytes,
+                packets
+        );
+
+        // Write to LOG_FILE_PATH
+        try (FileWriter fw = new FileWriter(LOG_FILE_PATH, true); PrintWriter pw = new PrintWriter(fw)) {
+            pw.println(logEntry);
+            log.info("TCP connection logged: {}", logEntry);
+        } 
+        catch (IOException e) {
+            log.error("Error writing TCP connection stats to log file", e);
+        }
+
+    }
 
     // TODO: TASK 19 - Implement logAllConnectionStats method
-    // private void logAllConnectionStats() {
-    //     // Iterate through tcpConnections and log stats for each
-    // }
+    private void logAllConnectionStats() {
+
+        // Iterate through tcpConnections and log stats for each
+        for (Map.Entry<ConnectionKey, TcpConnectionInfo> entry : tcpConnections.entrySet()) {
+            ConnectionKey connKey = entry.getKey();
+            TcpConnectionInfo info = entry.getValue();
+
+            // For simplicity, log with zero bytes/packets (real implementation would track these)
+            logTcpConnectionStats(connKey, info, 0, 0);
+        }
+    }
 
     // ============================================================================
     // HELPER CLASSES
@@ -312,19 +565,84 @@ public class LearningBridgeApp {
 
     // TODO: TASK 20 - Implement ConnectionKey class
     // See IMPLEMENTATION_GUIDE.md for structure and purpose
-    /*
     private static class ConnectionKey {
+        
         // Fields to uniquely identify TCP connection
+        private final MacAddress srcMac;
+        private final MacAddress dstMac;
+        private final Ip4Address srcIp;
+        private final Ip4Address dstIp;
+        private final int srcPort;
+        private final int dstPort;
+        
+        public ConnectionKey(MacAddress srcMac, MacAddress dstMac, Ip4Address srcIp, Ip4Address dstIp, int srcPort, int dstPort) {
+            this.srcMac = srcMac;
+            this.dstMac = dstMac;
+            this.srcIp = srcIp;
+            this.dstIp = dstIp;
+            this.srcPort = srcPort;
+            this.dstPort = dstPort;
+        }
+
         // Implement equals() and hashCode()
+        @Override
+        public boolean equals(Object obj) {
+            if (this == obj) return true;
+            if (!(obj instanceof ConnectionKey)) return false;
+
+            ConnectionKey other = (ConnectionKey) obj;
+            return 
+                srcPort == other.srcPort &&
+                dstPort == other.dstPort &&
+                java.util.Objects.equals(srcMac, other.srcMac) &&
+                java.util.Objects.equals(dstMac, other.dstMac) &&
+                java.util.Objects.equals(srcIp, other.srcIp) &&
+                java.util.Objects.equals(dstIp, other.dstIp)
+            ;
+        }
+
+        @Override
+        public int hashCode() {
+            return java.util.Objects.hash(srcMac, dstMac, srcIp, dstIp, srcPort, dstPort);
+        }
+
+        @Override
+        public String toString() {
+            return String.format("%s:%d -> %s:%d", srcIp, srcPort, dstIp, dstPort);
+        }
     }
-    */
 
     // TODO: TASK 21 - Implement TcpConnectionInfo class
     // See IMPLEMENTATION_GUIDE.md for structure and purpose
-    /*
     private static class TcpConnectionInfo {
+
         // Fields to store connection metadata
+        private final DeviceId deviceId;
+        private final MacAddress srcMac;
+        private final MacAddress dstMac;    
+        private final long startTimeMillis;
+        private long endTimeMillis = -1; // Initialized to -1 (set on removal)
+
+        public TcpConnectionInfo(DeviceId deviceId, MacAddress srcMac, MacAddress dstMac, long startTimeMillis) {
+            this.deviceId = deviceId;
+            this.srcMac = srcMac;
+            this.dstMac = dstMac;
+            this.startTimeMillis = startTimeMillis;
+        }
+    
+
+        public void setEndTime() {
+            this.endTimeMillis = System.currentTimeMillis();
+        }
+        
         // Method to calculate duration
+        public long getDurationMillis() {
+            if (endTimeMillis == -1) {
+                return System.currentTimeMillis() - startTimeMillis;
+            }
+            return endTimeMillis - startTimeMillis;
+        }
+
     }
-    */
+
 }
